@@ -13,6 +13,8 @@ random.seed(0)
 parser = argparse.ArgumentParser()
 parser.add_argument("--batch", type=int, default=4)
 parser.add_argument("--iters", type=int, default=100)
+parser.add_argument("--packed", action="store_true")
+parser.add_argument("--sink", action="store_true")
 args = parser.parse_args()
 
 B = args.batch
@@ -21,6 +23,7 @@ N = 128
 D = 512
 dtype = torch.bfloat16
 scale = 1.0 / math.sqrt(D)
+block_size = 128
 
 q = torch.randn(B, H, 1, D, dtype=dtype, device="cuda")
 k = torch.randn(B, 1, N, D, dtype=dtype, device="cuda")
@@ -30,6 +33,51 @@ indices = torch.stack(
     dim=0,
 ).view(B, 1, N, 1).contiguous()
 out = torch.empty(B, H, 1, D, dtype=dtype, device="cuda")
+attn_sink = torch.linspace(-0.1, 0.1, H, dtype=torch.float32, device="cuda")
+
+
+def fp8_dtype():
+    if hasattr(torch, "float8_e4m3fnuz"):
+        return torch.float8_e4m3fnuz
+    return torch.float8_e4m3fn
+
+
+def pack_fp8_ds_mla_cache(kv):
+    assert kv.shape == (B * N, D)
+    cache = torch.zeros(
+        (B, block_size, 584),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    cache_flat = cache.view(torch.uint8).flatten()
+    kv_nope_fp8 = kv[:, :448].to(fp8_dtype()).view(torch.uint8)
+    kv_rope_u8 = kv[:, 448:].contiguous().view(torch.uint8)
+
+    for slot in range(kv.shape[0]):
+        block_idx = slot // block_size
+        pos = slot % block_size
+        block_base = block_idx * cache.stride(0)
+        token_base = block_base + pos * 576
+        scale_base = block_base + block_size * 576 + pos * 8
+        cache_flat[token_base : token_base + 448].copy_(kv_nope_fp8[slot])
+        cache_flat[token_base + 448 : token_base + 448 + 64 * 2].copy_(
+            kv_rope_u8[slot]
+        )
+        cache_flat[scale_base : scale_base + 7].fill_(127)
+    return cache
+
+
+def read_fp8_ds_mla_cache(cache, slot):
+    cache_flat = cache.view(torch.uint8).flatten()
+    block_idx = slot // block_size
+    pos = slot % block_size
+    block_base = block_idx * cache.stride(0)
+    token_base = block_base + pos * 576
+    nope = cache_flat[token_base : token_base + 448].view(fp8_dtype()).float()
+    rope = cache_flat[token_base + 448 : token_base + 448 + 64 * 2].view(
+        torch.bfloat16
+    ).float()
+    return torch.cat([nope, rope])
 
 
 def ref_attention(q, k, v):
@@ -42,10 +90,43 @@ def ref_attention(q, k, v):
     return torch.einsum("bhlt,btd->bhld", probs, vg.float()).to(dtype)
 
 
-ref = ref_attention(q, k, v)
+def ref_packed_attention(q, cache):
+    q_f32 = q.float()
+    result = torch.empty_like(q_f32)
+    idx = indices[:, 0, :, 0].long()
+    for b in range(B):
+        kv = torch.stack(
+            [read_fp8_ds_mla_cache(cache, int(slot.item())) for slot in idx[b]]
+        )
+        for h in range(H):
+            scores = torch.mv(kv, q_f32[b, h, 0]) * scale
+            if args.sink:
+                scores_with_sink = torch.cat([scores, attn_sink[h].reshape(1)])
+                probs = torch.softmax(scores_with_sink, dim=0)[:-1]
+            else:
+                probs = torch.softmax(scores, dim=0)
+            result[b, h, 0] = torch.sum(probs[:, None] * kv, dim=0)
+    return result.to(dtype)
+
+
+if args.packed:
+    # vLLM's sparse decode cache is paged globally, so each batch row points at
+    # its own 128-token block here.
+    kv_flat = k.view(B * N, D)
+    cache = pack_fp8_ds_mla_cache(kv_flat)
+    indices = (indices + (torch.arange(B, device="cuda", dtype=torch.int32) * N).view(B, 1, 1, 1)).contiguous()
+    ref = ref_packed_attention(q, cache)
+else:
+    cache = None
+    ref = ref_attention(q, k, v)
 
 for _ in range(10):
-    dsv4_decode_kernel.dispatch_decode(q, k, v, indices, out, scale)
+    if args.packed:
+        dsv4_decode_kernel.dispatch_packed_decode(
+            q, cache, indices, attn_sink, out, scale, int(args.sink)
+        )
+    else:
+        dsv4_decode_kernel.dispatch_decode(q, k, v, indices, out, scale)
 torch.cuda.synchronize()
 
 diff = (out.float() - ref.float()).abs()
@@ -60,14 +141,22 @@ end = torch.cuda.Event(enable_timing=True)
 iters = args.iters
 start.record()
 for _ in range(iters):
-    dsv4_decode_kernel.dispatch_decode(q, k, v, indices, out, scale)
+    if args.packed:
+        dsv4_decode_kernel.dispatch_packed_decode(
+            q, cache, indices, attn_sink, out, scale, int(args.sink)
+        )
+    else:
+        dsv4_decode_kernel.dispatch_decode(q, k, v, indices, out, scale)
 end.record()
 torch.cuda.synchronize()
 print(f"hk_ms={start.elapsed_time(end) / iters:.6f}")
 
 start.record()
 for _ in range(iters):
-    ref = ref_attention(q, k, v)
+    if args.packed:
+        ref = ref_packed_attention(q, cache)
+    else:
+        ref = ref_attention(q, k, v)
 end.record()
 torch.cuda.synchronize()
 print(f"torch_ms={start.elapsed_time(end) / iters:.6f}")
