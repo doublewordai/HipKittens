@@ -15,6 +15,11 @@ parser.add_argument("--batch", type=int, default=4)
 parser.add_argument("--iters", type=int, default=100)
 parser.add_argument("--packed", action="store_true")
 parser.add_argument("--sink", action="store_true")
+parser.add_argument(
+    "--vllm",
+    action="store_true",
+    help="Also run vLLM's ROCm Triton sparse decode baseline. Packed mode only.",
+)
 args = parser.parse_args()
 
 B = args.batch
@@ -109,6 +114,39 @@ def ref_packed_attention(q, cache):
     return result.to(dtype)
 
 
+def make_vllm_ragged():
+    # vLLM's ragged decode API expects one query row per batch item:
+    # q=[B,H,D], indices=[B*N], indptr=[B+1].
+    main_indices = indices[:, 0, :, 0].reshape(-1).contiguous()
+    main_indptr = torch.arange(
+        0,
+        (B + 1) * N,
+        N,
+        device="cuda",
+        dtype=torch.int32,
+    )
+    return main_indices, main_indptr
+
+
+def vllm_sparse_decode(q, cache):
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+        _rocm_sparse_attn_decode_ragged_triton,
+    )
+
+    main_indices, main_indptr = make_vllm_ragged()
+    out_bhd = _rocm_sparse_attn_decode_ragged_triton(
+        q=q[:, :, 0, :].contiguous(),
+        main_cache=cache,
+        main_indices=main_indices,
+        main_indptr=main_indptr,
+        scale=scale,
+        attn_sink=attn_sink if args.sink else None,
+        nope_head_dim=448,
+        rope_head_dim=64,
+    )
+    return out_bhd[:, :, None, :]
+
+
 if args.packed:
     # vLLM's sparse decode cache is paged globally, so each batch row points at
     # its own 128-token block here.
@@ -117,6 +155,8 @@ if args.packed:
     indices = (indices + (torch.arange(B, device="cuda", dtype=torch.int32) * N).view(B, 1, 1, 1)).contiguous()
     ref = ref_packed_attention(q, cache)
 else:
+    if args.vllm:
+        raise SystemExit("--vllm requires --packed")
     cache = None
     ref = ref_attention(q, k, v)
 
@@ -160,3 +200,23 @@ for _ in range(iters):
 end.record()
 torch.cuda.synchronize()
 print(f"torch_ms={start.elapsed_time(end) / iters:.6f}")
+
+if args.vllm:
+    for _ in range(10):
+        vllm_out = vllm_sparse_decode(q, cache)
+    torch.cuda.synchronize()
+
+    vllm_diff = (vllm_out.float() - ref.float()).abs()
+    vllm_cos = torch.nn.functional.cosine_similarity(
+        vllm_out.float().flatten(), ref.float().flatten(), dim=0
+    )
+    print(f"vllm_max_diff={vllm_diff.max().item():.6f}")
+    print(f"vllm_mean_diff={vllm_diff.mean().item():.6f}")
+    print(f"vllm_cos={vllm_cos.item():.8f}")
+
+    start.record()
+    for _ in range(iters):
+        vllm_out = vllm_sparse_decode(q, cache)
+    end.record()
+    torch.cuda.synchronize()
+    print(f"vllm_ms={start.elapsed_time(end) / iters:.6f}")
