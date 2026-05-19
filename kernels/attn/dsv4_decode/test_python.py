@@ -154,10 +154,12 @@ if args.packed:
     cache = pack_fp8_ds_mla_cache(kv_flat)
     indices = (indices + (torch.arange(B, device="cuda", dtype=torch.int32) * N).view(B, 1, 1, 1)).contiguous()
     ref = ref_packed_attention(q, cache)
+    stats = torch.empty(B, H, 1, 2, dtype=torch.float32, device="cuda")
 else:
     if args.vllm:
         raise SystemExit("--vllm requires --packed")
     cache = None
+    stats = None
     ref = ref_attention(q, k, v)
 
 for _ in range(10):
@@ -200,6 +202,22 @@ for _ in range(iters):
 end.record()
 torch.cuda.synchronize()
 print(f"torch_ms={start.elapsed_time(end) / iters:.6f}")
+
+if args.packed:
+    for _ in range(10):
+        dsv4_decode_kernel.dispatch_packed_stats(
+            q, cache, indices, attn_sink, stats, scale, int(args.sink)
+        )
+    torch.cuda.synchronize()
+
+    start.record()
+    for _ in range(iters):
+        dsv4_decode_kernel.dispatch_packed_stats(
+            q, cache, indices, attn_sink, stats, scale, int(args.sink)
+        )
+    end.record()
+    torch.cuda.synchronize()
+    print(f"hk_stats_ms={start.elapsed_time(end) / iters:.6f}")
 
 if args.vllm:
     for _ in range(10):

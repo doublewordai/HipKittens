@@ -61,6 +61,26 @@ template<int _D> struct packed_decode_globals {
     size_t dynamic_shared_memory() { return 0; }
 };
 
+template<int _D> struct packed_stats_globals {
+    using q_gl = gl<bf16, -1, -1, -1, -1>;       // [B, H, 1, D]
+    using cache_gl = gl<uint8_t, -1, -1, -1, -1>; // [blocks, block, 584]
+    using idx_gl = gl<int, -1, -1, -1, -1>;      // [B, 1, N, 1]
+    using sink_gl = gl<float, -1, -1, -1, -1>;   // [H]
+    using stats_gl = gl<float, -1, -1, -1, -1>;  // [B, H, 1, 2] = [m, l]
+
+    q_gl q;
+    cache_gl cache;
+    idx_gl indices;
+    sink_gl attn_sink;
+    stats_gl stats;
+    float scale;
+    int has_attn_sink;
+
+    dim3 grid() { return dim3(q.batch() * q.depth()); }
+    dim3 block() { return dim3(NUM_THREADS); }
+    size_t dynamic_shared_memory() { return 0; }
+};
+
 template<ducks::rv::all RV>
 __device__ static inline void zero_vec(RV &x) {
     #pragma unroll
@@ -268,6 +288,59 @@ void dsv4_decode_packed_swa_kernel(const packed_decode_globals<_D> g) {
 }
 
 template<int _D>
+__global__ __launch_bounds__(NUM_THREADS, 4)
+void dsv4_decode_packed_stats_kernel(const packed_stats_globals<_D> g) {
+    const int pid = blockIdx.x;
+    const int batch = pid / H;
+    const int head = pid - batch * H;
+    const int block_size = g.cache.rows();
+    const int block_stride = g.cache.template stride<1>();
+
+    rv<float, _D> q_reg, k_reg, prod;
+    load(q_reg, g.q, {batch, head, 0, 0});
+
+    float m = -INFINITY;
+    float l = 0.0f;
+
+    #pragma unroll
+    for (int t = 0; t < N; ++t) {
+        const int slot = g.indices[{batch, 0, t, 0}];
+
+        #pragma unroll
+        for (int i = 0; i < decltype(k_reg)::outer_dim; ++i) {
+            #pragma unroll
+            for (int j = 0; j < decltype(k_reg)::inner_dim; ++j) {
+                const int dim = i * 64 + laneid();
+                const float kv = load_packed_cache_value(g.cache.raw_ptr, block_size, block_stride, slot, dim);
+                k_reg[i][j] = kv;
+            }
+        }
+        mul_vec(prod, q_reg, k_reg);
+        float score;
+        sum(score, prod);
+        score *= g.scale;
+
+        const float new_m = fmaxf(m, score);
+        const float alpha = __expf(m - new_m);
+        const float beta = __expf(score - new_m);
+
+        l = l * alpha + beta;
+        m = new_m;
+    }
+
+    if (g.has_attn_sink) {
+        const float sink = g.attn_sink[{0, 0, 0, head}];
+        const float new_m = fmaxf(m, sink);
+        const float alpha = __expf(m - new_m);
+        l = l * alpha + __expf(sink - new_m);
+        m = new_m;
+    }
+
+    g.stats[{batch, head, 0, 0}] = m;
+    g.stats[{batch, head, 0, 1}] = l;
+}
+
+template<int _D>
 void dispatch_decode(decode_globals<_D> g) {
     dsv4_decode_dense_swa_kernel<_D><<<g.grid(), g.block(), 0>>>(g);
 }
@@ -275,6 +348,11 @@ void dispatch_decode(decode_globals<_D> g) {
 template<int _D>
 void dispatch_packed_decode(packed_decode_globals<_D> g) {
     dsv4_decode_packed_swa_kernel<_D><<<g.grid(), g.block(), 0>>>(g);
+}
+
+template<int _D>
+void dispatch_packed_stats(packed_stats_globals<_D> g) {
+    dsv4_decode_packed_stats_kernel<_D><<<g.grid(), g.block(), 0>>>(g);
 }
 
 PYBIND11_MODULE(dsv4_decode_kernel, m) {
@@ -295,5 +373,14 @@ PYBIND11_MODULE(dsv4_decode_kernel, m) {
         &packed_decode_globals<D>::o,
         &packed_decode_globals<D>::scale,
         &packed_decode_globals<D>::has_attn_sink
+    );
+    py::bind_function<dispatch_packed_stats<D>>(m, "dispatch_packed_stats",
+        &packed_stats_globals<D>::q,
+        &packed_stats_globals<D>::cache,
+        &packed_stats_globals<D>::indices,
+        &packed_stats_globals<D>::attn_sink,
+        &packed_stats_globals<D>::stats,
+        &packed_stats_globals<D>::scale,
+        &packed_stats_globals<D>::has_attn_sink
     );
 }
